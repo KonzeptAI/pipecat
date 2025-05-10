@@ -917,13 +917,47 @@ class RTVIProcessor(FrameProcessor):
         await self._handle_get_config(request_id)
 
     async def _handle_function_call_result(self, data):
-        frame = FunctionCallResultFrame(
-            function_name=data.function_name,
-            tool_call_id=data.tool_call_id,
-            arguments=data.arguments,
-            result=data.result,
-        )
-        await self.push_frame(frame)
+        # When result comes from frontend, it's passed to the LLMService.
+        # The LLMService's `_run_function_call` has a `result_callback`.
+        # That callback pushes a FunctionCallResultFrame DOWNSTREAM to the aggregator
+        # and UPSTREAM.
+        # This `_handle_function_call_result` in RTVIProcessor is called when the RTVI *client*
+        # sends a `llm-function-call-result` message.
+        # This means the LLMService's own `_tool_result` method should be called.
+
+        llm_service = self._pipeline.get_processor_by_type(LLMService)
+        if not llm_service:
+            logger.error(f"{self} No LLMService found in the pipeline to handle function call result.")
+            return
+
+        # We need to transform RTVILLMFunctionCallResultData to the format expected by _tool_result,
+        # which is essentially a dictionary similar to an OpenAI message of role "tool".
+        # The LLMService (parent of Gemini) will handle the specifics.
+        # The Gemini LLMService's _tool_result expects a dict like:
+        # {"role": "tool", "tool_call_id": ..., "function_name": ..., "name": ..., "content": ...}
+        tool_result_message_for_llm = {
+            "role": "tool",
+            "tool_call_id": data.tool_call_id,
+            "function_name": data.function_name,
+            "name": data.function_name,
+            "content": json.dumps(data.result) if isinstance(data.result, dict) else str(data.result)
+        }
+
+        # Call the _tool_result method on the LLM service instance.
+        # This method is responsible for sending the tool response to the Gemini API.
+        if hasattr(llm_service, "_tool_result") and callable(getattr(llm_service, "_tool_result")):
+            logger.info(f"{self} Forwarding tool result to LLMService._tool_result for {data.tool_call_id}")
+            await llm_service._tool_result(tool_result_message_for_llm)
+        else:
+            # Fallback: Push a FunctionCallResultFrame. This will go to the aggregator.
+            logger.warning(f"{self} LLMService does not have _tool_result, pushing FunctionCallResultFrame.")
+            frame = FunctionCallResultFrame(
+                function_name=data.function_name,
+                tool_call_id=data.tool_call_id,
+                arguments=data.arguments,
+                result=data.result,
+            )
+            await self.push_frame(frame)
 
     async def _handle_action(self, request_id: Optional[str], data: RTVIActionRun):
         action_id = self._action_id(data.service, data.action)
