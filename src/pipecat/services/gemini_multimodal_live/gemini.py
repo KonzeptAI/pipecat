@@ -378,11 +378,6 @@ class GeminiMultimodalLiveLLMService(LLMService):
             else {},
             "extra": params.extra if isinstance(params.extra, dict) else {},
         }
-        
-        # Track outstanding tool calls and state
-        self._outstanding_tool_ids: set[str] = set()
-        self._is_initial_context = True
-        self._waiting_for_model_turn_after_tool = False
 
     def can_generate_metrics(self) -> bool:
         return True
@@ -418,7 +413,6 @@ class GeminiMultimodalLiveLLMService(LLMService):
             return
         self._context = GeminiMultimodalLiveContext.upgrade(context)
         await self._create_initial_response()
-        self._is_initial_context = False  # Mark that initial context has been processed
 
     #
     # standard AIService frame handling
@@ -444,7 +438,6 @@ class GeminiMultimodalLiveLLMService(LLMService):
         self._bot_is_speaking = False
         await self.push_frame(TTSStoppedFrame())
         await self.push_frame(LLMFullResponseEndFrame())
-        self._waiting_for_model_turn_after_tool = False  # Reset on interruption
 
     async def _handle_user_started_speaking(self, frame):
         self._user_is_speaking = True
@@ -503,69 +496,48 @@ class GeminiMultimodalLiveLLMService(LLMService):
         if isinstance(frame, TranscriptionFrame):
             await self.push_frame(frame, direction)
         elif isinstance(frame, OpenAILLMContextFrame):
-            logger.info(f"{self} RECEIVED_CONTEXT_FRAME. Context: {frame.context.get_messages_for_logging()}")
-            logger.info(f"{self} State on receiving OpenAILLMContextFrame: _api_session_ready={self._api_session_ready}, _run_llm_when_api_session_ready={self._run_llm_when_api_session_ready}, _waiting_for_model_turn_after_tool={self._waiting_for_model_turn_after_tool}, _is_initial_context={self._is_initial_context}")
-
-            # Always update the internal context
-            self._context = GeminiMultimodalLiveContext.upgrade(frame.context)
-            if frame.context.tools: # Ensure tools are also updated if provided in the context frame
-                self._tools = frame.context.tools
-
-            logger.info(f"{self} After upgrading context, last message role: {self._context.messages[-1].get('role') if self._context.messages else 'no messages'}")
-            logger.info(f"{self} Outstanding tool IDs: {self._outstanding_tool_ids}")
-
-
-            if self._waiting_for_model_turn_after_tool:
-                logger.info(f"{self} Waiting for model turn after tool submission. Context updated, but no new LLM call initiated by this frame.")
-                # If we are waiting for a model turn after _tool_result, it means _tool_result
-                # has already sent `turnComplete:True`. We shouldn't send another one from here
-                # based on this context update alone. The context is now up-to-date for the *next* interaction.
-                return
-
-            # Check if this context contains a *newly added* tool result for an outstanding call
-            # This scenario handles the case where the aggregator processes FunctionCallResultFrame
-            # and pushes the updated context.
-            tool_result_to_process = None
-            if self._context.messages and self._outstanding_tool_ids:
-                for msg in reversed(self._context.messages): # Check recent messages first
-                    if msg.get("role") == "tool" and msg.get("tool_call_id") in self._outstanding_tool_ids:
-                        tool_result_to_process = msg
-                        break # Process one tool result from context at a time this way
-
-            if tool_result_to_process:
-                logger.info(f"{self} Context contains result for outstanding tool {tool_result_to_process.get('tool_call_id')}. Processing via _tool_result.")
-                await self._tool_result(tool_result_to_process)
-                # After _tool_result, _waiting_for_model_turn_after_tool will be True.
-                # The Gemini API has been informed. We should not call _create_response here.
-            elif self._is_initial_context:
-                logger.info(f"{self} Processing initial context via _create_initial_response.")
-                await self._create_initial_response() # This will set self._is_initial_context = False
-            elif self._context.messages and self._context.messages[-1].get("role") == "user":
-                logger.info(f"{self} Context is a user turn (last message is user). Calling _create_response.")
-                # This is a new user turn, or a user utterance after a tool call has been fully processed by the model.
-                await self._create_single_response([self._context.messages[-1]]) # Send only the last user message as the new turn
-            else:
-                # This case might happen if the context ends with an assistant message
-                # and no tool calls are pending, or if the context is empty after initial.
-                logger.info(f"{self} Context not identified as initial, pending tool response, or new user turn. Last role: {self._context.messages[-1].get('role') if self._context.messages else 'N/A'}. No LLM action taken by this frame.")
-
-        # ... (rest of process_frame conditions as you have them) ...
+            context: GeminiMultimodalLiveContext = GeminiMultimodalLiveContext.upgrade(
+                frame.context
+            )
+            # For now, we'll only trigger inference here when either:
+            #   1. We have not seen a context frame before
+            #   2. The last message is a tool call result
+            if not self._context:
+                self._context = context
+                if frame.context.tools:
+                    self._tools = frame.context.tools
+                await self._create_initial_response()
+            elif context.messages and context.messages[-1].get("role") == "tool":
+                # Support just one tool call per context frame for now
+                tool_result_message = context.messages[-1]
+                await self._tool_result(tool_result_message)
         elif isinstance(frame, InputAudioRawFrame):
-            if not self._audio_input_paused:
-                await self._send_user_audio(frame)
+            await self._send_user_audio(frame)
             await self.push_frame(frame, direction)
-        # ... other elif ...
+        elif isinstance(frame, InputImageRawFrame):
+            await self._send_user_video(frame)
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, StartInterruptionFrame):
+            await self._handle_interruption()
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            await self._handle_user_started_speaking(frame)
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            await self._handle_user_stopped_speaking(frame)
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, BotStartedSpeakingFrame):
+            # Ignore this frame. Use the serverContent API message instead
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            # ignore this frame. Use the serverContent.turnComplete API message
+            await self.push_frame(frame, direction)
         elif isinstance(frame, LLMMessagesAppendFrame):
-            # This is for when the bot needs to say something unprompted by user,
-            # or to add a synthetic user/assistant message.
             await self._create_single_response(frame.messages)
         elif isinstance(frame, LLMUpdateSettingsFrame):
-            await self._update_settings(frame.settings) # You might need to re-send config to Gemini if session active
+            await self._update_settings(frame.settings)
         elif isinstance(frame, LLMSetToolsFrame):
-            self._tools = frame.tools # Store new tools
-            if self._context: # If context exists, update its tools
-                self._context.set_tools(frame.tools)
-            await self._update_settings() # Re-send config to Gemini if session active
+            await self._update_settings()
         else:
             await self.push_frame(frame, direction)
 
@@ -696,8 +668,6 @@ class GeminiMultimodalLiveLLMService(LLMService):
                 await self.cancel_task(self._transcribe_audio_task)
                 self._transcribe_audio_task = None
             self._disconnecting = False
-            self._outstanding_tool_ids.clear()  # Clear on disconnect
-            self._waiting_for_model_turn_after_tool = False
         except Exception as e:
             logger.error(f"{self} error disconnecting: {e}")
 
@@ -844,104 +814,47 @@ class GeminiMultimodalLiveLLMService(LLMService):
         )
         await self.send_client_event(evt)
 
-    async def _tool_result(self, tool_result_message: Dict[str, Any]):
-        # tool_result_message is expected to be a dict like:
-        # {"role": "tool", "content": "...", "tool_call_id": "...", "name": "optional_tool_name", "function_name": "actual_function_name"}
-        tool_call_id = tool_result_message.get("tool_call_id")
-        function_name = tool_result_message.get("function_name") or tool_result_message.get("name") # Prefer function_name if available
-
-        if not tool_call_id or not function_name:
-            logger.error(f"{self} Tool result message missing 'tool_call_id' or 'function_name'/'name': {tool_result_message}")
-            return
-
-        raw_content = tool_result_message.get("content", "")
-        try:
-            # Content from FunctionCallResultFrame is already a dict or string
-            if isinstance(raw_content, dict):
-                 parsed_content = raw_content
-            elif isinstance(raw_content, str):
-                try:
-                    parsed_content = json.loads(raw_content)
-                except (json.JSONDecodeError, TypeError):
-                    # If it's not valid JSON, wrap it as Gemini expects a dict for `response` part
-                    parsed_content = {"result_text": raw_content}
-            else: # If it's neither dict nor string, wrap it
-                parsed_content = {"result_value": str(raw_content)}
-
-        except Exception as e: # Catch any other parsing/conversion error
-            logger.error(f"Error processing tool result content '{raw_content}': {e}")
-            parsed_content = {"error": f"Failed to process tool result: {e}"}
-
-        # Ensure parsed_content is a dictionary for Gemini's `response` field.
-        if not isinstance(parsed_content, dict):
-            logger.warning(f"Tool result content '{parsed_content}' is not a dict, wrapping it.")
-            parsed_content = {"value": parsed_content}
-
-
-        response_message_payload = {
-            "toolResponse": {
-                "functionResponses": [
-                    {
-                        "id": tool_call_id,
-                        "name": function_name,
-                        "response": parsed_content, # This MUST be a dict for Gemini API
-                    }
-                ],
+    async def _tool_result(self, tool_result_message):
+        # For now we're shoving the name into the tool_call_id field, so this
+        # will work until we revisit that.
+        id = tool_result_message.get("tool_call_id")
+        name = tool_result_message.get("tool_call_name")
+        result = json.loads(tool_result_message.get("content") or "")
+        response_message = json.dumps(
+            {
+                "toolResponse": {
+                    "functionResponses": [
+                        {
+                            "id": id,
+                            "name": name,
+                            "response": {
+                                "result": result,
+                            },
+                        }
+                    ],
+                }
             }
-        }
-        response_message_str = json.dumps(response_message_payload)
-        logger.info(f"{self} SENDING TOOL RESPONSE for id={tool_call_id}, name={function_name}: {response_message_str}")
-        try:
-            if self._websocket:
-                await self._websocket.send(response_message_str)
-                logger.info(f"{self} Successfully sent tool response to Gemini API for {tool_call_id}")
-
-                if tool_call_id in self._outstanding_tool_ids:
-                    self._outstanding_tool_ids.discard(tool_call_id)
-                else:
-                    logger.warning(f"Tool ID {tool_call_id} was not in _outstanding_tool_ids when result was sent.")
-
-
-                turn_complete_message = json.dumps({"clientContent": {"turnComplete": True}})
-                logger.info(f"{self} SENDING TURN COMPLETE after tool response for {tool_call_id}: {turn_complete_message}")
-                await self._websocket.send(turn_complete_message)
-                logger.info(f"{self} Successfully sent turnComplete after tool response for {tool_call_id}")
-                self._waiting_for_model_turn_after_tool = True # Set flag HERE
-            else:
-                logger.error(f"{self} WebSocket not available, cannot send tool response for {tool_call_id}.")
-        except Exception as e:
-            logger.error(f"{self} Error sending tool response or turnComplete for {tool_call_id}: {e}")
-            self._outstanding_tool_ids.add(tool_call_id) # Re-add if sending failed, for potential retry
-            self._waiting_for_model_turn_after_tool = False # Reset if sending failed
+        )
+        await self._websocket.send(response_message)
+        # await self._websocket.send(json.dumps({"clientContent": {"turnComplete": True}}))
 
     async def _handle_evt_setup_complete(self, evt):
-        previous_state = self._api_session_ready
+        # If this is our first context frame, run the LLM
         self._api_session_ready = True
-        logger.info(f"{self} RECEIVED_SETUP_COMPLETE. API session ready. Status changed: {previous_state} -> {self._api_session_ready}")
+        # Now that we've configured the session, we can run the LLM if we need to.
         if self._run_llm_when_api_session_ready:
-            logger.info(f"{self} API session ready and _run_llm_when_api_session_ready is True. Creating initial response.")
             self._run_llm_when_api_session_ready = False
-            await self._create_initial_response() # This will set _is_initial_context to False
-        else:
-            logger.info(f"{self} API session ready but _run_llm_when_api_session_ready is False. Not creating initial response now.")
+            await self._create_initial_response()
 
     async def _handle_evt_model_turn(self, evt):
-        self._waiting_for_model_turn_after_tool = False # Model has started its turn
-        # ... (rest of your existing _handle_evt_model_turn logic) ...
-        logger.info(f"{self} RECEIVED_MODEL_TURN event. Model is generating a response. _waiting_for_model_turn_after_tool reset to False.")
-        
         part = evt.serverContent.modelTurn.parts[0]
         if not part:
-            logger.warning(f"{self} Model turn contains no parts")
             return
 
         # part.text is added when `modalities` is set to TEXT; otherwise, it's None
         text = part.text
         if text:
-            logger.info(f"{self} Model generated text: {text[:100]}...")
-            
-            if not self._bot_text_buffer: # First chunk of a new response
-                logger.info(f"{self} First text chunk of response, sending LLMFullResponseStartFrame")
+            if not self._bot_text_buffer:
                 await self.push_frame(LLMFullResponseStartFrame())
 
             self._bot_text_buffer += text
@@ -961,9 +874,7 @@ class GeminiMultimodalLiveLLMService(LLMService):
         if not self._bot_is_speaking:
             self._bot_is_speaking = True
             await self.push_frame(TTSStartedFrame())
-            if not self._bot_text_buffer: # If no text was generated, still send start frame
-                 await self.push_frame(LLMFullResponseStartFrame())
-
+            await self.push_frame(LLMFullResponseStartFrame())
 
         self._bot_audio_buffer.extend(audio)
         frame = TTSAudioRawFrame(
@@ -974,55 +885,30 @@ class GeminiMultimodalLiveLLMService(LLMService):
         await self.push_frame(frame)
 
     async def _handle_evt_tool_call(self, evt):
-        logger.info(f"{self} RECEIVED_TOOL_CALL event. Model is requesting a tool call.")
-        function_calls = evt.toolCall.functionCalls if evt.toolCall else []
+        function_calls = evt.toolCall.functionCalls
         if not function_calls:
-            logger.warning(f"{self} Tool call event contains no function calls")
             return
         if not self._context:
-            logger.error(f"{self} Function calls are not supported without a context object.")
-            return
-        logger.info(f"{self} Processing {len(function_calls)} function calls from tool call event")
+            logger.error("Function calls are not supported without a context object.")
         for call in function_calls:
-            logger.info(f"{self} Calling function: id={call.id}, name={call.name}, args={call.args}")
-            self._outstanding_tool_ids.add(call.id)
-            try:
-                await self.call_function(
-                    context=self._context,
-                    tool_call_id=call.id,
-                    function_name=call.name,
-                    arguments=call.args,
-                )
-                logger.info(f"{self} Successfully initiated call for function {call.name}")
-            except Exception as e:
-                logger.error(f"{self} Error initiating call for function {call.name}: {e}")
-                self._outstanding_tool_ids.discard(call.id)
+            await self.call_function(
+                context=self._context,
+                tool_call_id=call.id,
+                function_name=call.name,
+                arguments=call.args,
+            )
 
     async def _handle_evt_turn_complete(self, evt):
-        self._waiting_for_model_turn_after_tool = False # Model's turn is complete
-        # ... (rest of your existing _handle_evt_turn_complete logic) ...
-        logger.info(f"{self} RECEIVED_TURN_COMPLETE event. Model has finished its turn. _waiting_for_model_turn_after_tool reset to False.")
-        
-        # Mark bot as no longer speaking
-        previous_speaking_state = self._bot_is_speaking
         self._bot_is_speaking = False
-        logger.info(f"{self} Bot speaking state changed: {previous_speaking_state} -> {self._bot_is_speaking}")
-        
-        # Log accumulated bot text
         text = self._bot_text_buffer
-        text_preview = text[:100] + "..." if len(text) > 100 else text
-        logger.info(f"{self} Final bot text buffer on turn complete: {text_preview}")
         self._bot_text_buffer = ""
 
-        # Only push the TTSStoppedFrame if the bot is outputting audio
-        # when text is found, modalities is set to TEXT and no audio is produced.
-        if self._settings["modalities"] == GeminiMultimodalModalities.AUDIO or not text:
-            logger.info(f"{self} Modalities include AUDIO or no text, sending TTSStoppedFrame")
+        # Only push the TTSStoppedFrame the bot is outputting audio
+        # when text is found, modalities is set to TEXT and no audio
+        # is produced.
+        if not text:
             await self.push_frame(TTSStoppedFrame())
-        else:
-            logger.info(f"{self} Modalities TEXT only and text present, not sending TTSStoppedFrame.")
 
-        logger.info(f"{self} Sending LLMFullResponseEndFrame to signal end of LLM response")
         await self.push_frame(LLMFullResponseEndFrame())
 
     async def _handle_evt_output_transcription(self, evt):
